@@ -23,7 +23,6 @@ TARGET_URL = "https://ud.floor.line.games/kr/bbs/community/community_kr/1"
 TARGET_SHEET_NAME = os.getenv("TARGET_SHEET_NAME", "언디셈버_KR_플로어 동향")
 SPREADSHEET_ID = os.getenv("GOOGLE_SPREADSHEET_ID", "").strip()
 
-# Railway 변수명 호환
 GOOGLE_SERVICE_ACCOUNT_JSON = (
     os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
     or os.getenv("GOOGLE_CREDENTIALS", "").strip()
@@ -177,15 +176,15 @@ def find_matched_keywords(title: str) -> str:
 
     for keyword in SUGGESTION_KEYWORDS:
         if keyword.lower() in text:
-            matched.append(f"건의:{keyword}")
+            matched.append(keyword)
 
     for keyword in NEGATIVE_KEYWORDS:
         if keyword.lower() in text:
-            matched.append(f"부정:{keyword}")
+            matched.append(keyword)
 
     for keyword in POSITIVE_KEYWORDS:
         if keyword.lower() in text:
-            matched.append(f"긍정:{keyword}")
+            matched.append(keyword)
 
     matched = list(dict.fromkeys(matched))
     return ", ".join(matched)
@@ -221,17 +220,34 @@ def parse_board_posts(html: str) -> List[Dict]:
     posts = []
     seen_urls = set()
 
+    META_PATTERN = re.compile(
+        r"""
+        ^(?P<title>.+?)                                          # 제목
+        \s+
+        (?P<view>\d+)                                            # 조회수
+        (?:\s+(?P<like>\d+))?                                    # 추천수(있을 수도)
+        (?:\s+(?P<extra>\d+))?                                   # 추가 숫자(댓글/비추천 등)
+        \s+
+        \[(?P<guild>[^\]]+)\]                                    # 길드명
+        \s+
+        (?P<author>.+?)                                          # 작성자
+        \s+
+        (?P<time>\d+\s*분 전|\d+\s*시간 전|\d+\s*일 전|\d{4}\.\d{2}\.\d{2})  # 작성일
+        $
+        """,
+        re.VERBOSE
+    )
+
     for a in anchors:
         href = a.get("href", "").strip()
         if "/detail/" not in href and "/bbsCmn/detail/" not in href:
             continue
 
-        title = normalize_text(a.get_text(" ", strip=True))
-        if not title:
+        raw_text = normalize_text(a.get_text(" ", strip=True))
+        if not raw_text:
             continue
 
-        # 상단 공지 영역 제외
-        if any(title.startswith(prefix) for prefix in NOTICE_PREFIXES):
+        if any(raw_text.startswith(prefix) for prefix in NOTICE_PREFIXES):
             continue
 
         url = resolve_url(href)
@@ -244,16 +260,40 @@ def parse_board_posts(html: str) -> List[Dict]:
         if not post_id:
             continue
 
-        parent_text = normalize_text(a.parent.get_text(" ", strip=True)) if a.parent else title
-        tail = parent_text.replace(title, "", 1).strip()
+        m = META_PATTERN.match(raw_text)
 
-        time_text = ""
-        time_match = re.search(
-            r"(\d+\s*분 전|\d+\s*시간 전|\d+\s*일 전|\d{4}\.\d{2}\.\d{2})",
-            tail
-        )
-        if time_match:
-            time_text = time_match.group(1).strip()
+        if m:
+            title = normalize_text(m.group("title"))
+            time_text = normalize_text(m.group("time"))
+        else:
+            time_match = re.search(
+                r"(\d+\s*분 전|\d+\s*시간 전|\d+\s*일 전|\d{4}\.\d{2}\.\d{2})$",
+                raw_text
+            )
+            time_text = time_match.group(1).strip() if time_match else ""
+
+            title = raw_text
+            if time_text:
+                title = raw_text[:time_match.start()].strip()
+
+            # 뒤쪽 메타 제거 재시도
+            title = re.sub(
+                r"""
+                \s+\d+                      # 조회수
+                (?:\s+\d+)?                # 추천수
+                (?:\s+\d+)?                # 추가 숫자
+                \s+\[[^\]]+\]              # 길드명
+                \s+.+?                     # 작성자
+                \s*(\d+\s*분 전|\d+\s*시간 전|\d+\s*일 전|\d{4}\.\d{2}\.\d{2})?$
+                """,
+                "",
+                title,
+                flags=re.VERBOSE
+            ).strip()
+
+        title = normalize_text(title)
+        if not title:
+            continue
 
         sentiment = classify_post(title)
         matched_keywords = find_matched_keywords(title)
@@ -335,9 +375,6 @@ def ensure_sheet_and_header(service):
 
 
 def get_existing_links(service) -> set:
-    """
-    D열(링크) 기준 중복 체크
-    """
     result = service.spreadsheets().values().get(
         spreadsheetId=SPREADSHEET_ID,
         range=f"'{TARGET_SHEET_NAME}'!D2:D"
