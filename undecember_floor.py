@@ -2,7 +2,7 @@ import os
 import re
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 
 import pytz
@@ -22,7 +22,12 @@ TARGET_URL = "https://ud.floor.line.games/kr/bbs/community/community_kr/1"
 
 TARGET_SHEET_NAME = os.getenv("TARGET_SHEET_NAME", "언디셈버_KR_플로어 동향")
 SPREADSHEET_ID = os.getenv("GOOGLE_SPREADSHEET_ID", "").strip()
-GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+
+# Railway 변수명 호환
+GOOGLE_SERVICE_ACCOUNT_JSON = (
+    os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    or os.getenv("GOOGLE_CREDENTIALS", "").strip()
+)
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
 
@@ -39,6 +44,20 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
+
+
+# =========================
+# 공지 제외 규칙
+# =========================
+NOTICE_PREFIXES = [
+    "[공지사항]",
+    "[알려진 현상]",
+    "[업데이트]",
+    "[이벤트]",
+    "[모험일지]",
+    "[코코의 편지]",
+    "[콘텐츠 시간표]",
+]
 
 
 # =========================
@@ -72,13 +91,6 @@ def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip()
 
 
-def safe_int(text: str, default: int = 0) -> int:
-    if text is None:
-        return default
-    m = re.search(r"\d+", str(text).replace(",", ""))
-    return int(m.group(0)) if m else default
-
-
 def resolve_url(href: str) -> str:
     if not href:
         return ""
@@ -91,18 +103,20 @@ def extract_post_id(url: str) -> Optional[str]:
     m = re.search(r"/detail/(\d+)", url)
     if m:
         return m.group(1)
+
     m = re.search(r"/bbsCmn/detail/(\d+)", url)
     if m:
         return m.group(1)
+
     return None
 
 
 def parse_time_text_to_iso(time_text: str) -> str:
     """
     예시:
+    - 25분 전
+    - 3시간 전
     - 1일 전
-    - 3일 전
-    - 2026.03.18
     - 2026.03.25
     """
     if not time_text:
@@ -113,27 +127,26 @@ def parse_time_text_to_iso(time_text: str) -> str:
 
     m = re.match(r"(\d+)\s*분 전", text)
     if m:
-        dt = now - pytz.timedelta(minutes=int(m.group(1)))
-        return dt.isoformat()
+        dt = now - timedelta(minutes=int(m.group(1)))
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
 
     m = re.match(r"(\d+)\s*시간 전", text)
     if m:
-        dt = now - pytz.timedelta(hours=int(m.group(1)))
-        return dt.isoformat()
+        dt = now - timedelta(hours=int(m.group(1)))
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
 
     m = re.match(r"(\d+)\s*일 전", text)
     if m:
-        from datetime import timedelta
         dt = now - timedelta(days=int(m.group(1)))
-        return dt.isoformat()
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
 
     try:
         dt = date_parser.parse(text)
         if dt.tzinfo is None:
             dt = KST.localize(dt)
-        return dt.isoformat()
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
-        return ""
+        return text
 
 
 def classify_post(title: str) -> str:
@@ -174,7 +187,6 @@ def find_matched_keywords(title: str) -> str:
         if keyword.lower() in text:
             matched.append(f"긍정:{keyword}")
 
-    # 중복 제거
     matched = list(dict.fromkeys(matched))
     return ", ".join(matched)
 
@@ -207,7 +219,7 @@ def parse_board_posts(html: str) -> List[Dict]:
     anchors = soup.find_all("a", href=True)
 
     posts = []
-    seen_ids = set()
+    seen_urls = set()
 
     for a in anchors:
         href = a.get("href", "").strip()
@@ -218,49 +230,22 @@ def parse_board_posts(html: str) -> List[Dict]:
         if not title:
             continue
 
-        url = resolve_url(href)
-        post_id = extract_post_id(url)
-        if not post_id or post_id in seen_ids:
+        # 상단 공지 영역 제외
+        if any(title.startswith(prefix) for prefix in NOTICE_PREFIXES):
             continue
 
-        seen_ids.add(post_id)
+        url = resolve_url(href)
+        if not url or url in seen_urls:
+            continue
 
-        # 공지 여부
-        is_notice = title.startswith("[")
-        category = ""
-        category_match = re.match(r"^\[([^\]]+)\]", title)
-        if category_match:
-            category = category_match.group(1).strip()
+        seen_urls.add(url)
+
+        post_id = extract_post_id(url)
+        if not post_id:
+            continue
 
         parent_text = normalize_text(a.parent.get_text(" ", strip=True)) if a.parent else title
-        line_text = parent_text
-
-        # title 제거 후 뒤 메타 읽기
-        tail = line_text.replace(title, "", 1).strip()
-
-        # 일반글 패턴 예시
-        # 담시즌 허수맥스딜좀 풀어줘요... 154 1 1 [니쿠니쿠우니] 화니쿤 1일 전
-        # 무기 부분 전승 153 2 [언디레져렉션] 뭔셈버 1일 전
-        # 운영자 보아라 190 1 1 [悪魔をも屠れる] 캣타워철거반 3일 전
-
-        numbers = re.findall(r"\b\d+\b", tail)
-        view_count = safe_int(numbers[0], 0) if len(numbers) >= 1 else 0
-
-        # 숫자 패턴이 2개면 보통 조회수 + 댓글수
-        # 숫자 패턴이 3개면 조회수 + 추천수 + 댓글수 or 조회수 + 댓글수 + 추천수
-        comment_count = 0
-        like_count = 0
-
-        if len(numbers) == 2:
-            comment_count = safe_int(numbers[1], 0)
-        elif len(numbers) >= 3:
-            like_count = safe_int(numbers[1], 0)
-            comment_count = safe_int(numbers[2], 0)
-
-        guild_name = ""
-        guild_match = re.search(r"\[([^\]]+)\]", tail)
-        if guild_match:
-            guild_name = guild_match.group(1).strip()
+        tail = parent_text.replace(title, "", 1).strip()
 
         time_text = ""
         time_match = re.search(
@@ -270,28 +255,12 @@ def parse_board_posts(html: str) -> List[Dict]:
         if time_match:
             time_text = time_match.group(1).strip()
 
-        author = ""
-        if time_text:
-            left = tail.split(time_text)[0].strip()
-            if guild_name:
-                left = left.replace(f"[{guild_name}]", "").strip()
-            tokens = left.split()
-            if tokens:
-                author = tokens[-1].strip()
-
         sentiment = classify_post(title)
         matched_keywords = find_matched_keywords(title)
 
         posts.append({
             "post_id": post_id,
-            "is_notice": "Y" if is_notice else "N",
-            "category": category,
             "title": title,
-            "view_count": view_count,
-            "like_count": like_count,
-            "comment_count": comment_count,
-            "guild_name": guild_name,
-            "author": author,
             "time_text": time_text,
             "time_iso_kst": parse_time_text_to_iso(time_text),
             "url": url,
@@ -308,8 +277,9 @@ def parse_board_posts(html: str) -> List[Dict]:
 def get_sheets_service():
     if not SPREADSHEET_ID:
         raise ValueError("GOOGLE_SPREADSHEET_ID 환경변수가 비어 있습니다.")
+
     if not GOOGLE_SERVICE_ACCOUNT_JSON:
-        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON 환경변수가 비어 있습니다.")
+        raise ValueError("GOOGLE_CREDENTIALS 또는 GOOGLE_SERVICE_ACCOUNT_JSON 환경변수가 비어 있습니다.")
 
     info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
     creds = Credentials.from_service_account_info(info, scopes=SCOPES)
@@ -341,42 +311,36 @@ def ensure_sheet_and_header(service):
 
     result = service.spreadsheets().values().get(
         spreadsheetId=SPREADSHEET_ID,
-        range=f"'{TARGET_SHEET_NAME}'!A1:O2"
+        range=f"'{TARGET_SHEET_NAME}'!A1:F2"
     ).execute()
 
     values = result.get("values", [])
     if not values:
         header = [[
-            "post_id",
-            "is_notice",
-            "category",
-            "title",
-            "view_count",
-            "like_count",
-            "comment_count",
-            "guild_name",
-            "author",
-            "time_text",
-            "time_iso_kst",
-            "url",
-            "sentiment",
-            "matched_keywords",
-            "collected_at_kst"
+            "수집일자",
+            "작성일자",
+            "제목",
+            "링크",
+            "분류",
+            "매칭 키워드"
         ]]
 
         service.spreadsheets().values().update(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"'{TARGET_SHEET_NAME}'!A1:O1",
+            range=f"'{TARGET_SHEET_NAME}'!A1:F1",
             valueInputOption="RAW",
             body={"values": header}
         ).execute()
         logging.info("헤더 생성 완료")
 
 
-def get_existing_post_ids(service) -> set:
+def get_existing_links(service) -> set:
+    """
+    D열(링크) 기준 중복 체크
+    """
     result = service.spreadsheets().values().get(
         spreadsheetId=SPREADSHEET_ID,
-        range=f"'{TARGET_SHEET_NAME}'!A2:A"
+        range=f"'{TARGET_SHEET_NAME}'!D2:D"
     ).execute()
 
     values = result.get("values", [])
@@ -386,7 +350,7 @@ def get_existing_post_ids(service) -> set:
         if row and row[0]:
             existing.add(str(row[0]).strip())
 
-    logging.info("기존 post_id 수: %d", len(existing))
+    logging.info("기존 링크 수: %d", len(existing))
     return existing
 
 
@@ -397,7 +361,7 @@ def append_rows(service, rows: List[List[str]]):
 
     service.spreadsheets().values().append(
         spreadsheetId=SPREADSHEET_ID,
-        range=f"'{TARGET_SHEET_NAME}'!A:O",
+        range=f"'{TARGET_SHEET_NAME}'!A:F",
         valueInputOption="RAW",
         insertDataOption="INSERT_ROWS",
         body={"values": rows}
@@ -414,37 +378,30 @@ def run():
 
     service = get_sheets_service()
     ensure_sheet_and_header(service)
-    existing_post_ids = get_existing_post_ids(service)
+    existing_links = get_existing_links(service)
 
     session = create_session()
     html = fetch_board_html(session)
     posts = parse_board_posts(html)
 
-    logging.info("파싱된 게시글 수: %d", len(posts))
+    logging.info("파싱된 일반 게시글 수: %d", len(posts))
 
-    new_posts = [p for p in posts if p["post_id"] not in existing_post_ids]
+    new_posts = [p for p in posts if p["url"] not in existing_links]
     logging.info("신규 게시글 수: %d", len(new_posts))
 
-    collected_at = now_kst().isoformat()
+    collected_at = now_kst().strftime("%Y-%m-%d %H:%M:%S")
 
     rows = []
     for post in new_posts:
+        written_at = post.get("time_iso_kst", "") or post.get("time_text", "")
+
         rows.append([
-            post["post_id"],
-            post["is_notice"],
-            post["category"],
-            post["title"],
-            post["view_count"],
-            post["like_count"],
-            post["comment_count"],
-            post["guild_name"],
-            post["author"],
-            post["time_text"],
-            post["time_iso_kst"],
-            post["url"],
-            post["sentiment"],
-            post["matched_keywords"],
-            collected_at,
+            collected_at,               # A열: 수집일자
+            written_at,                 # B열: 작성일자
+            post["title"],              # C열: 제목
+            post["url"],                # D열: 링크
+            post["sentiment"],          # E열: 분류
+            post["matched_keywords"],   # F열: 매칭 키워드
         ])
 
     append_rows(service, rows)
