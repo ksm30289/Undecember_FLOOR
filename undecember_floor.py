@@ -18,7 +18,8 @@ from googleapiclient.discovery import build
 # 기본 설정
 # =========================
 BASE_URL = "https://ud.floor.line.games"
-TARGET_URL = "https://ud.floor.line.games/kr/bbs/community/community_kr/1"
+TARGET_URL_TEMPLATE = "https://ud.floor.line.games/kr/bbs/community/community_kr/{page}"
+MAX_PAGE = int(os.getenv("MAX_PAGE", "3"))
 
 TARGET_SHEET_NAME = os.getenv("TARGET_SHEET_NAME", "언디셈버_KR_플로어 동향")
 SPREADSHEET_ID = os.getenv("GOOGLE_SPREADSHEET_ID", "").strip()
@@ -111,13 +112,6 @@ def extract_post_id(url: str) -> Optional[str]:
 
 
 def parse_time_text_to_iso(time_text: str) -> str:
-    """
-    예시:
-    - 25분 전
-    - 3시간 전
-    - 1일 전
-    - 2026.03.25
-    """
     if not time_text:
         return ""
 
@@ -149,13 +143,6 @@ def parse_time_text_to_iso(time_text: str) -> str:
 
 
 def classify_post(title: str) -> str:
-    """
-    우선순위:
-    1) 건의
-    2) 부정
-    3) 긍정
-    4) 기타
-    """
     text = normalize_text(title).lower()
 
     if any(keyword.lower() in text for keyword in SUGGESTION_KEYWORDS):
@@ -203,9 +190,10 @@ def create_session() -> requests.Session:
     return session
 
 
-def fetch_board_html(session: requests.Session) -> str:
-    logging.info("게시판 1페이지 크롤링 시작: %s", TARGET_URL)
-    response = session.get(TARGET_URL, timeout=REQUEST_TIMEOUT)
+def fetch_board_html(session: requests.Session, page: int) -> str:
+    url = TARGET_URL_TEMPLATE.format(page=page)
+    logging.info("게시판 %s페이지 크롤링 시작: %s", page, url)
+    response = session.get(url, timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
     return response.text
 
@@ -222,17 +210,17 @@ def parse_board_posts(html: str) -> List[Dict]:
 
     META_PATTERN = re.compile(
         r"""
-        ^(?P<title>.+?)                                          # 제목
+        ^(?P<title>.+?)
         \s+
-        (?P<view>\d+)                                            # 조회수
-        (?:\s+(?P<like>\d+))?                                    # 추천수(있을 수도)
-        (?:\s+(?P<extra>\d+))?                                   # 추가 숫자(댓글/비추천 등)
+        (?P<view>\d+)
+        (?:\s+(?P<like>\d+))?
+        (?:\s+(?P<extra>\d+))?
         \s+
-        \[(?P<guild>[^\]]+)\]                                    # 길드명
+        \[(?P<guild>[^\]]+)\]
         \s+
-        (?P<author>.+?)                                          # 작성자
+        (?P<author>.+?)
         \s+
-        (?P<time>\d+\s*분 전|\d+\s*시간 전|\d+\s*일 전|\d{4}\.\d{2}\.\d{2})  # 작성일
+        (?P<time>\d+\s*분 전|\d+\s*시간 전|\d+\s*일 전|\d{4}\.\d{2}\.\d{2})
         $
         """,
         re.VERBOSE
@@ -276,14 +264,13 @@ def parse_board_posts(html: str) -> List[Dict]:
             if time_text:
                 title = raw_text[:time_match.start()].strip()
 
-            # 뒤쪽 메타 제거 재시도
             title = re.sub(
                 r"""
-                \s+\d+                      # 조회수
-                (?:\s+\d+)?                # 추천수
-                (?:\s+\d+)?                # 추가 숫자
-                \s+\[[^\]]+\]              # 길드명
-                \s+.+?                     # 작성자
+                \s+\d+
+                (?:\s+\d+)?
+                (?:\s+\d+)?
+                \s+\[[^\]]+\]
+                \s+.+?
                 \s*(\d+\s*분 전|\d+\s*시간 전|\d+\s*일 전|\d{4}\.\d{2}\.\d{2})?$
                 """,
                 "",
@@ -418,12 +405,29 @@ def run():
     existing_links = get_existing_links(service)
 
     session = create_session()
-    html = fetch_board_html(session)
-    posts = parse_board_posts(html)
 
-    logging.info("파싱된 일반 게시글 수: %d", len(posts))
+    all_posts = []
+    seen_urls = set()
 
-    new_posts = [p for p in posts if p["url"] not in existing_links]
+    for page in range(1, MAX_PAGE + 1):
+        try:
+            html = fetch_board_html(session, page)
+            posts = parse_board_posts(html)
+
+            logging.info("%s페이지 파싱 게시글 수: %d", page, len(posts))
+
+            for post in posts:
+                if post["url"] in seen_urls:
+                    continue
+                seen_urls.add(post["url"])
+                all_posts.append(post)
+
+        except Exception as e:
+            logging.exception("%s페이지 수집 실패: %s", page, e)
+
+    logging.info("전체 파싱 게시글 수(중복 제거 후): %d", len(all_posts))
+
+    new_posts = [p for p in all_posts if p["url"] not in existing_links]
     logging.info("신규 게시글 수: %d", len(new_posts))
 
     collected_at = now_kst().strftime("%Y-%m-%d %H:%M:%S")
@@ -433,12 +437,12 @@ def run():
         written_at = post.get("time_iso_kst", "") or post.get("time_text", "")
 
         rows.append([
-            collected_at,               # A열: 수집일자
-            written_at,                 # B열: 작성일자
-            post["title"],              # C열: 제목
-            post["url"],                # D열: 링크
-            post["sentiment"],          # E열: 분류
-            post["matched_keywords"],   # F열: 매칭 키워드
+            collected_at,
+            written_at,
+            post["title"],
+            post["url"],
+            post["sentiment"],
+            post["matched_keywords"],
         ])
 
     append_rows(service, rows)
