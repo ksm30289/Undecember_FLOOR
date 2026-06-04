@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import time
 import logging
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
@@ -12,6 +13,7 @@ from dateutil import parser as date_parser
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 
 # =========================
@@ -69,14 +71,17 @@ POSITIVE_KEYWORDS = [
 ]
 
 NEGATIVE_KEYWORDS = [
-    "망", "망했", "망겜", "별로", "최악", "쓰레기", "노잼", "재미없", "불만", "불편", "운영", "잠수", "멈추", "멈춤", "튕김", "튕기", "팅겨",
-    "오류", "버그", "렉", "문제", "짜증", "실망", "화난", "접는다", "도망", "환불", "안됩", "너프", "멈춰", "이따위", "튕겨", "팅김", "재접",
-    "비싸", "비쌈", "과금", "말이되냐", "개선안됨", "안됨", "안된다", "터짐", "죽었", "욕", "핑계", "이따구", "창렬"
+    "망", "망했", "망겜", "별로", "최악", "쓰레기", "노잼", "재미없", "불만", "불편",
+    "운영", "잠수", "멈추", "멈춤", "튕김", "튕기", "팅겨", "오류", "버그", "렉",
+    "문제", "짜증", "실망", "화난", "접는다", "도망", "환불", "안됩", "너프",
+    "멈춰", "이따위", "튕겨", "팅김", "재접", "비싸", "비쌈", "과금", "말이되냐",
+    "개선안됨", "안됨", "안된다", "터짐", "죽었", "욕", "핑계", "이따구", "창렬"
 ]
 
 SUGGESTION_KEYWORDS = [
-    "해주세요", "해줘", "부탁", "건의", "개선", "추가", "상향", "하향", "바꿔", "변경", "완화", "해주",
-    "필요", "원합니다", "원해요", "고쳐", "수정", "해주면", "검토", "해줬으면", "풀어줘"
+    "해주세요", "해줘", "부탁", "건의", "개선", "추가", "상향", "하향", "바꿔",
+    "변경", "완화", "해주", "필요", "원합니다", "원해요", "고쳐", "수정",
+    "해주면", "검토", "해줬으면", "풀어줘"
 ]
 
 
@@ -94,8 +99,10 @@ def normalize_text(text: str) -> str:
 def resolve_url(href: str) -> str:
     if not href:
         return ""
+
     if href.startswith("http://") or href.startswith("https://"):
         return href
+
     return BASE_URL + href
 
 
@@ -135,9 +142,12 @@ def parse_time_text_to_iso(time_text: str) -> str:
 
     try:
         dt = date_parser.parse(text)
+
         if dt.tzinfo is None:
             dt = KST.localize(dt)
+
         return dt.strftime("%Y-%m-%d %H:%M:%S")
+
     except Exception:
         return text
 
@@ -177,24 +187,59 @@ def find_matched_keywords(title: str) -> str:
     return ", ".join(matched)
 
 
+def safe_execute(request, retries: int = 5):
+    for attempt in range(retries):
+        try:
+            return request.execute()
+
+        except HttpError as e:
+            status = getattr(e.resp, "status", None)
+
+            if status in [429, 500, 502, 503, 504]:
+                wait = min(2 ** attempt, 30)
+
+                logging.warning(
+                    "Google API 일시 오류 발생 status=%s, %s초 후 재시도 (%s/%s)",
+                    status,
+                    wait,
+                    attempt + 1,
+                    retries
+                )
+
+                time.sleep(wait)
+                continue
+
+            raise
+
+        except Exception:
+            raise
+
+    raise RuntimeError("Google API 재시도 후에도 실패했습니다.")
+
+
 # =========================
 # HTTP
 # =========================
 def create_session() -> requests.Session:
     session = requests.Session()
+
     session.headers.update({
         "User-Agent": USER_AGENT,
         "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
         "Referer": BASE_URL
     })
+
     return session
 
 
 def fetch_board_html(session: requests.Session, page: int) -> str:
     url = TARGET_URL_TEMPLATE.format(page=page)
+
     logging.info("게시판 %s페이지 크롤링 시작: %s", page, url)
+
     response = session.get(url, timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
+
     return response.text
 
 
@@ -208,7 +253,7 @@ def parse_board_posts(html: str) -> List[Dict]:
     posts = []
     seen_urls = set()
 
-    META_PATTERN = re.compile(
+    meta_pattern = re.compile(
         r"""
         ^(?P<title>.+?)
         \s+
@@ -228,6 +273,7 @@ def parse_board_posts(html: str) -> List[Dict]:
 
     for a in anchors:
         href = a.get("href", "").strip()
+
         if "/detail/" not in href and "/bbsCmn/detail/" not in href:
             continue
 
@@ -239,6 +285,7 @@ def parse_board_posts(html: str) -> List[Dict]:
             continue
 
         url = resolve_url(href)
+
         if not url or url in seen_urls:
             continue
 
@@ -248,16 +295,18 @@ def parse_board_posts(html: str) -> List[Dict]:
         if not post_id:
             continue
 
-        m = META_PATTERN.match(raw_text)
+        m = meta_pattern.match(raw_text)
 
         if m:
             title = normalize_text(m.group("title"))
             time_text = normalize_text(m.group("time"))
+
         else:
             time_match = re.search(
                 r"(\d+\s*분 전|\d+\s*시간 전|\d+\s*일 전|\d{4}\.\d{2}\.\d{2})$",
                 raw_text
             )
+
             time_text = time_match.group(1).strip() if time_match else ""
 
             title = raw_text
@@ -279,6 +328,7 @@ def parse_board_posts(html: str) -> List[Dict]:
             ).strip()
 
         title = normalize_text(title)
+
         if not title:
             continue
 
@@ -309,17 +359,28 @@ def get_sheets_service():
         raise ValueError("GOOGLE_CREDENTIALS 또는 GOOGLE_SERVICE_ACCOUNT_JSON 환경변수가 비어 있습니다.")
 
     info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-    creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+
+    creds = Credentials.from_service_account_info(
+        info,
+        scopes=SCOPES
+    )
+
     return build("sheets", "v4", credentials=creds)
 
 
 def ensure_sheet_and_header(service):
-    spreadsheet = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+    spreadsheet = safe_execute(
+        service.spreadsheets().get(
+            spreadsheetId=SPREADSHEET_ID
+        )
+    )
+
     sheets = spreadsheet.get("sheets", [])
     sheet_names = [s["properties"]["title"] for s in sheets]
 
     if TARGET_SHEET_NAME not in sheet_names:
         logging.info("시트 생성: %s", TARGET_SHEET_NAME)
+
         body = {
             "requests": [
                 {
@@ -331,17 +392,23 @@ def ensure_sheet_and_header(service):
                 }
             ]
         }
-        service.spreadsheets().batchUpdate(
-            spreadsheetId=SPREADSHEET_ID,
-            body=body
-        ).execute()
 
-    result = service.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"'{TARGET_SHEET_NAME}'!A1:F2"
-    ).execute()
+        safe_execute(
+            service.spreadsheets().batchUpdate(
+                spreadsheetId=SPREADSHEET_ID,
+                body=body
+            )
+        )
+
+    result = safe_execute(
+        service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"'{TARGET_SHEET_NAME}'!A1:F2"
+        )
+    )
 
     values = result.get("values", [])
+
     if not values:
         header = [[
             "수집일자",
@@ -352,20 +419,25 @@ def ensure_sheet_and_header(service):
             "매칭 키워드"
         ]]
 
-        service.spreadsheets().values().update(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"'{TARGET_SHEET_NAME}'!A1:F1",
-            valueInputOption="RAW",
-            body={"values": header}
-        ).execute()
+        safe_execute(
+            service.spreadsheets().values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"'{TARGET_SHEET_NAME}'!A1:F1",
+                valueInputOption="RAW",
+                body={"values": header}
+            )
+        )
+
         logging.info("헤더 생성 완료")
 
 
 def get_existing_links(service) -> set:
-    result = service.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"'{TARGET_SHEET_NAME}'!D2:D"
-    ).execute()
+    result = safe_execute(
+        service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"'{TARGET_SHEET_NAME}'!D2:D"
+        )
+    )
 
     values = result.get("values", [])
     existing = set()
@@ -375,6 +447,7 @@ def get_existing_links(service) -> set:
             existing.add(str(row[0]).strip())
 
     logging.info("기존 링크 수: %d", len(existing))
+
     return existing
 
 
@@ -383,15 +456,31 @@ def append_rows(service, rows: List[List[str]]):
         logging.info("추가할 신규 데이터 없음")
         return
 
-    service.spreadsheets().values().append(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"'{TARGET_SHEET_NAME}'!A:F",
-        valueInputOption="RAW",
-        insertDataOption="INSERT_ROWS",
-        body={"values": rows}
-    ).execute()
+    chunk_size = int(os.getenv("SHEETS_APPEND_CHUNK_SIZE", "50"))
 
-    logging.info("시트에 %d행 추가 완료", len(rows))
+    total = len(rows)
+
+    for start in range(0, total, chunk_size):
+        chunk = rows[start:start + chunk_size]
+
+        safe_execute(
+            service.spreadsheets().values().append(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"'{TARGET_SHEET_NAME}'!A:F",
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={"values": chunk}
+            )
+        )
+
+        logging.info(
+            "시트에 %d행 추가 완료 (%d/%d)",
+            len(chunk),
+            min(start + len(chunk), total),
+            total
+        )
+
+        time.sleep(1)
 
 
 # =========================
@@ -401,7 +490,9 @@ def run():
     logging.info("언디셈버 KR 플로어 동향 수집 시작")
 
     service = get_sheets_service()
+
     ensure_sheet_and_header(service)
+
     existing_links = get_existing_links(service)
 
     session = create_session()
@@ -419,6 +510,7 @@ def run():
             for post in posts:
                 if post["url"] in seen_urls:
                     continue
+
                 seen_urls.add(post["url"])
                 all_posts.append(post)
 
@@ -427,12 +519,17 @@ def run():
 
     logging.info("전체 파싱 게시글 수(중복 제거 후): %d", len(all_posts))
 
-    new_posts = [p for p in all_posts if p["url"] not in existing_links]
+    new_posts = [
+        p for p in all_posts
+        if p["url"] not in existing_links
+    ]
+
     logging.info("신규 게시글 수: %d", len(new_posts))
 
     collected_at = now_kst().strftime("%Y-%m-%d %H:%M:%S")
 
     rows = []
+
     for post in new_posts:
         written_at = post.get("time_iso_kst", "") or post.get("time_text", "")
 
@@ -446,6 +543,7 @@ def run():
         ])
 
     append_rows(service, rows)
+
     logging.info("작업 종료")
 
 
